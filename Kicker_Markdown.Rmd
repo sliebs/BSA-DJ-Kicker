@@ -1,0 +1,758 @@
+---
+title: "Data Journalism W25"
+output: html_document
+date: "2025-02-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+library(nflfastR)
+library(dplyr)
+library(ggplot2)
+library(glmnet)  # For logistic regression
+```
+
+```{r}
+# Load all available seasons from 2000 onward
+seasons <- 2000:2023
+pbp_data <- purrr::map_df(seasons, load_pbp)
+
+#TAKES A LONG TIME TO LOAD IN DATA
+```
+
+```{r}
+# Filter for field goal attempts
+fg_data <- pbp_data %>%
+  filter(play_type == "field_goal") %>%  #| play_type == "extra_point"
+  select(
+    #game data
+    season, game_id, season_type, posteam, defteam, home_team, home_wp, 
+    qtr, quarter_seconds_remaining, play_clock, desc,
+    
+    #kick data
+    kicker_player_name, kicker_player_id, kick_distance, field_goal_attempt, field_goal_result, 
+         
+    #game conditions
+    roof, wind, temp, weather, side_of_field, surface, game_stadium, stadium, stadium_id,
+    score_differential, score_differential_post,
+    
+    #probabilities  
+    #extra_point prob ... copy for PATs
+    wpa, fg_prob, ep, epa
+    ) %>%
+  mutate(kick_made = case_when(
+    field_goal_result == "made" ~ 1,
+    field_goal_result %in% c("blocked", "missed") ~ 0,
+    TRUE ~ NA_real_  # This handles any other cases
+  )) %>%
+  mutate(xp = fg_prob * 3,
+         xpa = (kick_made * 3) - xp)
+
+#find stadium elevation data using location DB
+#find game_time weather conditions using weather DB (for wind, snow, humidity, temp)
+
+```
+
+
+```{r}
+fg_summary <- fg_data %>%
+  group_by(kick_distance) %>%
+  summarize(avg_fg_prob = mean(fg_prob, na.rm = TRUE))
+
+# Bar graph
+# Save first plot: FG Probability by Kick Distance
+p1 <- ggplot(fg_summary, aes(x = kick_distance, y = avg_fg_prob)) +
+  geom_line(color = "steelblue", size = 1) +  
+  geom_point(color = "darkblue", size = 2, alpha = 0.7) +  
+  geom_smooth(method = "loess", color = "black", linetype = "dashed") +  
+  labs(title = "Smoothed FG Probability by Kick Distance",
+       x = "Kick Distance (yards)",
+       y = "Average FG Probability") +
+  theme_minimal()
+
+ggsave("fg_probability_plot.png", plot = p1, width = 8, height = 6, dpi = 300)
+
+
+# Save second plot: Distribution of Field Goal Attempts
+p2 <- ggplot(fg_data, aes(x = kick_distance)) +
+  geom_histogram(binwidth = 1, fill = "darkred", color = "black", alpha = 0.7) +
+  labs(title = "Distribution of Field Goal Attempts by Distance",
+       x = "Kick Distance (yards)",
+       y = "Number of Attempts") +
+  theme_minimal()
+
+ggsave("fg_attempts_distribution.png", plot = p2, width = 8, height = 6, dpi = 300)
+
+```
+
+```{r}
+# Calculate FG% per kicker
+kicker_stats <- fg_data %>%
+  filter(field_goal_attempt == 1) %>%  # Only FG attempts
+  group_by(kicker_player_id) %>%
+  summarize(
+    total_attempts = n(),
+    total_made = sum(field_goal_result == "made", na.rm = TRUE),
+    fg_percentage = total_made / total_attempts * 100
+  ) %>%
+  filter(total_attempts >= 50)  # Minimum 50 attempts
+
+kicker_stats <- kicker_stats %>%
+  arrange(desc(fg_percentage))
+
+# Create the scatter plot
+p3 <- ggplot(kicker_stats, aes(x = total_attempts, y = fg_percentage)) +
+  geom_point(color = "darkred", alpha = 0.7, size = 3) +  # Scatter plot
+  labs(title = "Career FG% vs. Field Goal Attempts (Min 50 Attempts)",
+       x = "Career FG Attempts",
+       y = "Career FG Percentage") +
+  theme_minimal()
+
+# Save the plot
+ggsave("career_fg_percentage_vs_attempts.png", plot = p3, width = 8, height = 6, dpi = 300)
+
+```
+
+
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+
+
+```{r}
+PAT_data <- pbp_data %>%
+  filter(play_type == "extra_point") %>%  #| play_type == "extra_point"
+  select(
+    #game data
+    season, game_id, season_type, posteam, defteam, home_team, home_wp, 
+    qtr, quarter_seconds_remaining, play_clock, desc,
+    
+    #kick data
+    kicker_player_name, kicker_player_id, kick_distance, extra_point_attempt, extra_point_result, 
+         
+    #game conditions
+    roof, wind, temp, weather, side_of_field, surface, game_stadium, stadium, stadium_id, 
+    score_differential, score_differential_post,
+    
+    #probabilities  
+    #extra_point prob ... copy for PATs
+    wpa, extra_point_prob, ep, epa
+    ) %>%
+  mutate(kick_made = case_when(
+    extra_point_result == "good" ~ 1,
+    extra_point_result %in% c("blocked", "failed", "aborted") ~ 0,
+    TRUE ~ NA_real_  # This handles any other cases
+  )) %>%
+  mutate(xp = extra_point_prob,
+          xpa = kick_made - xp)
+```
+
+
+``` {r}
+combined_data <- bind_rows(fg_data, PAT_data) %>%
+  select(xp, xpa, kicker_player_name, kicker_player_id)
+
+kicker_names <- combined_data %>%
+  select(kicker_player_id, kicker_player_name) %>%
+  distinct(kicker_player_id, .keep_all = TRUE)
+
+kicker_xp_summary <- combined_data %>%
+  group_by(kicker_player_id) %>%
+  summarize(total_xpa = sum(xpa, na.rm = TRUE),
+            kicks_attempted = n()) %>%
+  ungroup() %>%
+  mutate(xpa_per_kick = total_xpa / kicks_attempted) %>%
+  left_join(kicker_names, by = "kicker_player_id")
+
+```
+
+
+### Making Kicking Data
+Note-> KICKING DATA IS FOR ALL GAMES, INCLUDING PLAYOFFS
+
+``` {r}
+#temporary field goal pct% data
+kicker_fg_data_temp <- fg_data %>% 
+  group_by(kicker_player_id) %>%
+  summarize(total_fg_xpa = sum(xpa, na.rm = TRUE),
+            total_fg_wpa = sum(wpa, na.rm = TRUE),
+            fg_made = sum(kick_made,na.rm = TRUE),
+            fg_attempted = n()) %>%
+  ungroup() %>%
+  mutate(fg_pct = fg_made / fg_attempted,
+         xpa_per_fg = total_fg_xpa / fg_attempted) %>%
+  left_join(kicker_names, by = "kicker_player_id") %>%
+  filter(fg_attempted >= 20)
+
+#temporary PAT data
+kicker_PAT_data_temp <- PAT_data %>% 
+  group_by(kicker_player_id) %>%
+  summarize(total_PAT_xpa= sum(xpa, na.rm = TRUE),
+            total_PAT_wpa = sum(wpa, na.rm = TRUE),
+            PAT_made = sum(kick_made),
+            PAT_attempted = n()) %>%
+  ungroup() %>%
+  mutate(PAT_pct = PAT_made / PAT_attempted,
+         xp_per_PAT = total_PAT_xpa / PAT_attempted) #%>%
+  #left_join(kicker_names, by = "kicker_player_id")
+
+#data that has kicker fg%, PAT%, and xpa 
+kicking_data <- left_join(kicker_fg_data_temp, kicker_PAT_data_temp, by = "kicker_player_id") %>%
+    mutate(total_xpa = total_fg_xpa + total_PAT_xpa) %>%
+    mutate(total_wpa = total_fg_wpa + total_PAT_wpa) 
+
+rm(kicker_fg_data_temp, kicker_PAT_data_temp)
+```
+
+
+#Kick distance stats
+```{r}
+fg_distance_summary <- fg_data %>%
+  filter(!is.na(kick_distance)) %>%  # Remove missing values
+  summarize(
+    min_distance = min(kick_distance),
+    max_distance = max(kick_distance),
+    mean_distance = mean(kick_distance),
+    median_distance = median(kick_distance),
+    sd_distance = sd(kick_distance)
+  )
+
+print(fg_distance_summary)
+
+
+fg_distance_percentiles <- fg_data %>%
+  filter(!is.na(kick_distance)) %>%  # Remove missing values
+  summarize(
+    p25 = quantile(kick_distance, 0.25),
+    p50 = quantile(kick_distance, 0.50),  # Median
+    p75 = quantile(kick_distance, 0.75)
+  )
+
+print(fg_distance_percentiles)
+
+ggplot(fg_data, aes(x = kick_distance)) +
+  geom_histogram(binwidth = 5, fill = "blue", color = "black", alpha = 0.7) +
+  labs(title = "Distribution of Field Goal Attempt Distances",
+       x = "Field Goal Distance (yards)",
+       y = "Count") +
+  theme_minimal()
+
+```
+
+
+40+ and 50+ yard field goals 
+... DON'T RUN
+```{r}
+kicker_40yarder_temp <- fg_data %>% 
+  filter(kick_distance >= 40) %>%
+  group_by(kicker_player_id) %>%
+  summarize(total_fg_xpa_40 = sum(xpa, na.rm = TRUE),
+            fg_made_40 = sum(kick_made,na.rm = TRUE),
+            fg_attempted_40 = n()) %>%
+  ungroup() %>%
+  mutate(fg_pct_40 = fg_made_40 / fg_attempted_40,
+         xpa_per_fg_40 = total_fg_xpa_40 / fg_attempted_40)
+
+  
+kicker_50yarder_temp <- fg_data %>% 
+  filter(kick_distance >= 50) %>%
+  group_by(kicker_player_id) %>%
+  summarize(total_fg_xpa_50 = sum(xpa, na.rm = TRUE),
+            fg_made_50 = sum(kick_made,na.rm = TRUE),
+            fg_attempted_50 = n()) %>%
+  ungroup() %>%
+  mutate(fg_pct_50 = fg_made_50 / fg_attempted_50,
+         xpa_per_fg_50 = total_fg_xpa_50 / fg_attempted_50)
+  
+  
+kicking_data <- kicking_data %>% 
+  left_join(kicker_40yarder_temp, by = "kicker_player_id") %>%
+  left_join(kicker_50yarder_temp, by = "kicker_player_id")
+
+rm(kicker_40yarder_temp, kicker_50yarder_temp)
+
+```
+
+25th-75th percentile (29 yard-46 yards)
+75th percentile+ (46+-yard field goal)
+```{r}
+#25th percentile kick is 29 yards
+#75th percentile kick is 46 yards
+kicker_mid50yarder_temp <- fg_data %>% 
+  filter(kick_distance >= 29) %>%   #
+  filter(kick_distance < 46) %>%
+  group_by(kicker_player_id) %>%
+  summarize(total_fg_xpa_mid50tile = sum(xpa, na.rm = TRUE),
+            fg_made_mid50tile = sum(kick_made,na.rm = TRUE),
+            fg_attempted_mid50tile = n()) %>%
+  ungroup() %>%
+  mutate(fg_pct_mid50tile = fg_made_mid50tile / fg_attempted_mid50tile,
+         xpa_per_fg_mid50tile = total_fg_xpa_mid50tile / fg_attempted_mid50tile)
+
+  
+kicker_top25yarder_temp <- fg_data %>% 
+  filter(kick_distance >= 46) %>%
+  group_by(kicker_player_id) %>%
+  summarize(total_fg_xpa_top25tile = sum(xpa, na.rm = TRUE),
+            fg_made_top25tile = sum(kick_made,na.rm = TRUE),
+            fg_attempted_top25tile = n()) %>%
+  ungroup() %>%
+  mutate(fg_pct_top25tile = fg_made_top25tile / fg_attempted_top25tile,
+         xpa_per_fg_top25tile = total_fg_xpa_top25tile / fg_attempted_top25tile)
+  
+  
+kicking_data <- kicking_data %>% 
+  left_join(kicker_mid50yarder_temp, by = "kicker_player_id") %>%
+  left_join(kicker_top25yarder_temp, by = "kicker_player_id")
+
+rm(kicker_mid50yarder_temp, kicker_top25yarder_temp)
+```
+
+### POSTSEASON VS. REGULAR SEASON
+regular season field goals
+```{r}
+#REG FIELD GOALS
+#temporary field goal pct% data
+kicker_fg_data_temp <- fg_data %>% 
+  filter(season_type == "REG") %>%
+  group_by(kicker_player_id) %>%
+  summarize(total_fg_xpa_REG = sum(xpa, na.rm = TRUE),
+            fg_made_REG = sum(kick_made,na.rm = TRUE),
+            fg_attempted_REG = n()) %>%
+  ungroup() %>%
+  mutate(fg_pct_REG = fg_made_REG / fg_attempted_REG,
+         xpa_per_fg_REG = total_fg_xpa_REG / fg_attempted_REG) 
+
+#temporary xp data
+kicker_PAT_data_temp <- PAT_data %>% 
+  filter(season_type == "REG") %>%
+  group_by(kicker_player_id) %>%
+  summarize(total_PAT_xpa_REG= sum(xpa, na.rm = TRUE),
+            PAT_made_REG = sum(kick_made),
+            PAT_attempted_REG = n()) %>%
+  ungroup() %>%
+  mutate(PAT_pct_REG = PAT_made_REG / PAT_attempted_REG,
+         xp_per_PAT_REG = total_PAT_xpa_REG / PAT_attempted_REG) #%>%
+  #left_join(kicker_names, by = "kicker_player_id")
+
+#data that has kicker fg%, PAT%, and xpa 
+kicking_data_REG <- kicking_data %>%
+  select(kicker_player_id, kicker_player_name) %>%
+  left_join(kicker_fg_data_temp, by = "kicker_player_id") %>%
+  left_join(kicker_PAT_data_temp,by = "kicker_player_id") %>%
+  mutate(total_xpa_REG = total_fg_xpa_REG + total_PAT_xpa_REG)
+
+rm(kicker_fg_data_temp, kicker_PAT_data_temp)
+
+```
+
+post season field goals
+```{r}
+#POST SEASON FIELD GOALS
+#temporary field goal pct% data
+kicker_fg_data_temp <- fg_data %>% 
+  filter(season_type == "POST") %>%
+  group_by(kicker_player_id) %>%
+  summarize(total_fg_xpa_POST = sum(xpa, na.rm = TRUE),
+            fg_made_POST = sum(kick_made,na.rm = TRUE),
+            fg_attempted_POST = n()) %>%
+  ungroup() %>%
+  mutate(fg_pct_POST = fg_made_POST / fg_attempted_POST,
+         xpa_per_fg_POST = total_fg_xpa_POST / fg_attempted_POST) 
+
+#temporary xp data
+kicker_PAT_data_temp <- PAT_data %>% 
+  filter(season_type == "POST") %>%
+  group_by(kicker_player_id) %>%
+  summarize(total_PAT_xpa_POST = sum(xpa, na.rm = TRUE),
+            PAT_made_POST = sum(kick_made),
+            PAT_attempted_POST = n()) %>%
+  ungroup() %>%
+  mutate(PAT_pct_POST = PAT_made_POST / PAT_attempted_POST,
+         xp_per_PAT_POST = total_PAT_xpa_POST / PAT_attempted_POST) #%>%
+  #left_join(kicker_names, by = "kicker_player_id")
+
+#data that has kicker fg%, PAT%, and xpa 
+kicking_data_POST <- kicking_data %>%
+  select(kicker_player_id, kicker_player_name) %>%
+  left_join(kicker_fg_data_temp, by = "kicker_player_id") %>%
+  left_join(kicker_PAT_data_temp,by = "kicker_player_id") %>%
+  mutate(total_xpa_POST = total_fg_xpa_POST + total_PAT_xpa_POST)
+
+rm(kicker_fg_data_temp, kicker_PAT_data_temp)
+```
+
+post season vs. regular stats ... min 15 kicks in playoffs
+```{r}
+#Post
+REG_vs_POST_diff <- left_join(kicking_data_REG, kicking_data_POST, by = c("kicker_player_id", "kicker_player_name")) %>%
+  mutate(
+    fg_pct_diff = case_when(!is.na(fg_pct_REG) & !is.na(fg_pct_POST) ~ fg_pct_POST - fg_pct_REG),
+    xpa_per_fg_diff = case_when(!is.na(xpa_per_fg_REG) & !is.na(xpa_per_fg_POST) ~ xpa_per_fg_POST - xpa_per_fg_REG),
+    
+    PAT_pct_diff = case_when(!is.na(PAT_pct_REG) & !is.na(PAT_pct_POST) ~ PAT_pct_POST - PAT_pct_REG),
+    xp_per_PAT_diff = case_when(!is.na(xp_per_PAT_REG) & !is.na(xp_per_PAT_POST) ~ xp_per_PAT_POST - xp_per_PAT_REG)
+    ) %>%
+  filter((fg_attempted_POST + PAT_attempted_POST) >= 15)
+
+```
+
+
+#CLUTCHNESS
+
+Clutch field goals define as a game-tying or lead-taking kick with 5 mins left in 4th qtr or OT
+```{r}
+clutch_fg_data_temp <- fg_data %>%
+  filter(score_differential >= -3 & score_differential <= 0,  # Close game (0-3 points)
+         (qtr == 4 & quarter_seconds_remaining <= 300) | (qtr > 4))  %>%
+  group_by(kicker_player_id) %>%
+  summarize(total_fg_xpa = sum(xpa, na.rm = TRUE),
+            fg_made = sum(kick_made,na.rm = TRUE),
+            fg_attempted = n()) %>%
+  ungroup() %>%
+  mutate(fg_pct = fg_made / fg_attempted,
+         xpa_per_fg = total_fg_xpa / fg_attempted)
+
+clutch_PAT_data_temp <- PAT_data %>% 
+  filter(score_differential >= -1 & score_differential <= 0,  # Close game (0-1 points)
+         (qtr == 4 & quarter_seconds_remaining <= 300) | (qtr > 4))  %>%
+  group_by(kicker_player_id) %>%
+  summarize(total_PAT_xpa= sum(xpa, na.rm = TRUE),
+            PAT_made = sum(kick_made),
+            PAT_attempted = n()) %>%
+  ungroup() %>%
+  mutate(PAT_pct = PAT_made / PAT_attempted,
+         xp_per_PAT = total_PAT_xpa / PAT_attempted)
+
+clutch_fg_attempts <- kicking_data %>%
+  select(kicker_player_id, kicker_player_name) %>%
+  left_join(clutch_fg_data_temp) %>%
+  left_join(clutch_PAT_data_temp) %>%
+  mutate(total_xpa = total_fg_xpa + total_PAT_xpa) 
+
+rm(clutch_fg_data_temp, clutch_PAT_data_temp)
+
+#25th percentile kick is 29 yards
+#75th percentile kick is 46 yards
+kicker_mid50yarder_temp <- fg_data %>% 
+  filter(score_differential >= -3 & score_differential <= 0,  # Close game (0-3 points)
+       (qtr == 4 & quarter_seconds_remaining <= 300) | (qtr > 4))  %>%
+  filter(kick_distance >= 29) %>%   #
+  filter(kick_distance < 46) %>%
+  group_by(kicker_player_id) %>%
+  summarize(total_fg_xpa_mid50tile = sum(xpa, na.rm = TRUE),
+            fg_made_mid50tile = sum(kick_made,na.rm = TRUE),
+            fg_attempted_mid50tile = n()) %>%
+  ungroup() %>%
+  mutate(fg_pct_mid50tile = fg_made_mid50tile / fg_attempted_mid50tile,
+         xpa_per_fg_mid50tile = total_fg_xpa_mid50tile / fg_attempted_mid50tile)
+
+  
+kicker_top25yarder_temp <- fg_data %>% 
+  filter(score_differential >= -3 & score_differential <= 0,  # Close game (0-3 points)
+     (qtr == 4 & quarter_seconds_remaining <= 300) | (qtr > 4))  %>%
+  filter(kick_distance >= 46) %>%
+  group_by(kicker_player_id) %>%
+  summarize(total_fg_xpa_top25tile = sum(xpa, na.rm = TRUE),
+            fg_made_top25tile = sum(kick_made,na.rm = TRUE),
+            fg_attempted_top25tile = n()) %>%
+  ungroup() %>%
+  mutate(fg_pct_top25tile = fg_made_top25tile / fg_attempted_top25tile,
+         xpa_per_fg_top25tile = total_fg_xpa_top25tile / fg_attempted_top25tile)
+  
+  
+clutch_fg_attempts <- clutch_fg_attempts %>% 
+  left_join(kicker_mid50yarder_temp, by = "kicker_player_id") %>%
+  left_join(kicker_top25yarder_temp, by = "kicker_player_id") 
+
+rm(kicker_mid50yarder_temp, kicker_top25yarder_temp)
+
+```
+
+
+Clutch field goals define as any kick that brings the game within 1 score or gives the team a 2 possession lead in the 4th quarter or later
+
+```{r}
+
+clutch_fg_data_temp <- fg_data %>%
+  filter(score_differential >= -11 & score_differential <= 8,  # 1 possesion game (down 11-up 8)
+         (qtr >= 4))  %>%
+  group_by(kicker_player_id) %>%
+  summarize(total_fg_xpa = sum(xpa, na.rm = TRUE),
+            fg_made = sum(kick_made,na.rm = TRUE),
+            fg_attempted = n()) %>%
+  ungroup() %>%
+  mutate(fg_pct = fg_made / fg_attempted,
+         xpa_per_fg = total_fg_xpa / fg_attempted)
+
+clutch_PAT_data_temp <- PAT_data %>% 
+  filter(score_differential >= -9 & score_differential <= 8,  # 1 possesion game (down 11-up 8)
+         (qtr >= 4))  %>%
+  group_by(kicker_player_id) %>%
+  summarize(total_PAT_xpa= sum(xpa, na.rm = TRUE),
+            PAT_made = sum(kick_made),
+            PAT_attempted = n()) %>%
+  ungroup() %>%
+  mutate(PAT_pct = PAT_made / PAT_attempted,
+         xp_per_PAT = total_PAT_xpa / PAT_attempted)
+
+clutch_fg_attempts_2 <- kicking_data %>%
+  select(kicker_player_id, kicker_player_name) %>%
+  left_join(clutch_fg_data_temp) %>%
+  left_join(clutch_PAT_data_temp) %>%
+  mutate(total_xpa = total_fg_xpa + total_PAT_xpa) 
+
+rm(clutch_fg_data_temp, clutch_PAT_data_temp)
+
+#25th percentile kick is 29 yards
+#75th percentile kick is 46 yards
+kicker_mid50yarder_temp <- fg_data %>% 
+  filter(score_differential >= -11 & score_differential <= 8,  # 1 possesion game (down 11-up 8)
+         (qtr >= 4))  %>%
+  filter(kick_distance >= 29) %>%   #
+  filter(kick_distance < 46) %>%
+  group_by(kicker_player_id) %>%
+  summarize(total_fg_xpa_mid50tile = sum(xpa, na.rm = TRUE),
+            fg_made_mid50tile = sum(kick_made,na.rm = TRUE),
+            fg_attempted_mid50tile = n()) %>%
+  ungroup() %>%
+  mutate(fg_pct_mid50tile = fg_made_mid50tile / fg_attempted_mid50tile,
+         xpa_per_fg_mid50tile = total_fg_xpa_mid50tile / fg_attempted_mid50tile)
+
+  
+kicker_top25yarder_temp <- fg_data %>% 
+  filter(score_differential >= -11 & score_differential <= 8,  # 1 possesion game (down 11-up 8)
+         (qtr >= 4))  %>%
+  filter(kick_distance >= 46) %>%
+  group_by(kicker_player_id) %>%
+  summarize(total_fg_xpa_top25tile = sum(xpa, na.rm = TRUE),
+            fg_made_top25tile = sum(kick_made,na.rm = TRUE),
+            fg_attempted_top25tile = n()) %>%
+  ungroup() %>%
+  mutate(fg_pct_top25tile = fg_made_top25tile / fg_attempted_top25tile,
+         xpa_per_fg_top25tile = total_fg_xpa_top25tile / fg_attempted_top25tile)
+  
+  
+clutch_fg_attempts_2 <- clutch_fg_attempts_2 %>% 
+  left_join(kicker_mid50yarder_temp, by = "kicker_player_id") %>%
+  left_join(kicker_top25yarder_temp, by = "kicker_player_id") 
+
+rm(kicker_mid50yarder_temp, kicker_top25yarder_temp)
+```
+
+
+#GRAPHS
+```{r}
+#distribution of career xpa
+ggplot(kicking_data, aes(x = total_xpa)) +
+  geom_histogram(binwidth = 3, fill = "blue", color = "black", alpha = 0.7) +
+  labs(title = "Distribution of Expected Points Added (XPA)",
+       x = "Expected Points Added (XPA)",
+       y = "Number of Kickers (Min. 20 FG Attempts)") +
+  theme_minimal()
+
+# distribution of xpa compared to kicking accuracy
+ggplot(kicking_data, aes(x = fg_pct, y = total_xpa)) +
+  geom_point(color = "blue", alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE, color = "red", linetype = "dashed") +  # Linear trend line
+  labs(title = "Kicker Accuracy vs. Total XPA",
+       x = "Field Goal Percentage",
+       y = "Total Expected Points Added (XPA)") +
+  theme_minimal()
+
+
+```
+
+```{r, fig.width=14, fig.height=6}
+# Create scatter plot with XPA vs. Field Goal Attempts, and color by FG Percentage
+ggplot(kicking_data, aes(x = fg_attempted, y = total_xpa, color = fg_pct, label = kicker_player_name)) +
+  geom_point(alpha = 0.7, size = 3) +  # Points for each kicker
+  geom_text(aes(label = kicker_player_name), vjust = -1, hjust = 0.5, size = 4, check_overlap = TRUE) +  # Labels
+  scale_color_gradient(low = "red", high = "blue") +  # Color gradient for FG Percentage
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  # Dashed line at y = 0
+  labs(title = "XPA vs. Field Goal Attempts",
+       x = "Field Goal Attempts",
+       y = "Total Expected Points Added (XPA)",
+       color = "Field Goal Percentage") +
+  theme_minimal()
+
+
+```
+```{r}
+ggplot(REG_vs_POST_diff, aes(x = xpa_per_fg_REG, y = xpa_per_fg_POST, label = kicker_player_name)) +
+  geom_point(alpha = 0.7, size = 2, color = "blue") +  # Scatter plot for points
+  geom_text(aes(label = kicker_player_name), vjust = -1, hjust = 0.5, size = 2, check_overlap = FALSE) +  # Labels for kickers
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +  # Diagonal dashed line (x = y)
+  labs(title = "Comparison of XPA per FG: Regular Season vs. Postseason",
+       x = "XPA per FG (Regular Season)",
+       y = "XPA per FG (Postseason)") +
+  theme_minimal()
+
+ggplot(REG_vs_POST_diff, aes(x = fg_pct_REG, y = fg_pct_POST, label = kicker_player_name)) +
+  geom_point(alpha = 0.7, size = 2, color = "blue") +  # Scatter plot for points
+  geom_text(aes(label = kicker_player_name), vjust = -0.5, hjust = 0.5, size = 3, check_overlap = TRUE) +  # Labels for kickers
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +  # Diagonal dashed line (x = y)
+  labs(title = "Comparison of Field Goal Percentage: Regular Season vs. Postseason",
+       x = "Field Goal Percentage (Regular Season)",
+       y = "Field Goal Percentage (Postseason)") +
+  theme_minimal()
+
+```
+```{r, fig.width=14, fig.height=6}
+# Reshape the data into long format for both REG and POST
+library(tidyr)
+
+# Reshape the data into long format
+fg_data_long <- REG_vs_POST_diff %>%
+  select(kicker_player_name, fg_pct_REG, fg_pct_POST) %>%
+  pivot_longer(cols = c(fg_pct_REG, fg_pct_POST),
+               names_to = "season_type",
+               values_to = "fg_pct") %>%
+  mutate(season_type = recode(season_type, fg_pct_REG = "REG", fg_pct_POST = "POST"))
+
+# Plotting the graph
+ggplot(fg_data_long, aes(x = kicker_player_name, y = fg_pct, color = season_type)) +
+  geom_point(aes(shape = season_type), size = 4, alpha = 0.7) +  # Plot points for each season
+  scale_color_manual(values = c("green", "blue")) +  # Green for REG, Blue for POST
+  labs(title = "Field Goal Percentage: REG vs POST for Each Kicker",
+       x = "Kicker Player Name",
+       y = "Field Goal Percentage") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))   # Rotate player names on x-axis
+
+
+# Create scatter plot with XPA vs. Field Goal Attempts, and color by FG Percentage
+ggplot(REG_vs_POST_diff, aes(x = fg_attempted_POST, y = total_xpa_POST, color = fg_pct_POST, label = kicker_player_name)) +
+  geom_point(alpha = 0.7, size = 3) +  # Points for each kicker
+  geom_text(aes(label = kicker_player_name), vjust = -1, hjust = 0.5, size = 4, check_overlap = TRUE) +  # Labels
+  scale_color_gradient(low = "red", high = "blue") +  # Color gradient for FG Percentage
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  # Dashed line at y = 0
+  labs(title = "PLAYOFF XPA vs. Field Goal Attempts",
+       x = "Field Goal Attempts",
+       y = "Total Expected Points Added (XPA)",
+       color = "Field Goal Percentage") +
+  theme_minimal()
+```
+
+```{r, fig.width=14, fig.height=6}
+
+# Create scatter plot with XPA vs. Field Goal Attempts, and color by FG Percentage
+ggplot(clutch_fg_attempts, aes(x = fg_attempted, y = total_xpa, color = fg_pct, label = kicker_player_name)) +
+  geom_point(alpha = 0.7, size = 3) +  # Points for each kicker
+  geom_text(aes(label = kicker_player_name), vjust = -1, hjust = 0.5, size = 3, check_overlap = TRUE) +  # Labels
+  scale_color_gradient(low = "red", high = "blue") +  # Color gradient for FG Percentage
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  # Dashed line at y = 0
+  labs(title = "CLUTCH MOMENTS (Strict Definition) XPA vs. Field Goal Attempts",
+       x = "Field Goal Attempts",
+       y = "Total Expected Points Added (XPA)",
+       color = "Field Goal Percentage") +
+  theme_minimal()
+```
+
+```{r, fig.width=14, fig.height=6}
+
+# Create scatter plot with XPA vs. Field Goal Attempts, and color by FG Percentage
+ggplot(clutch_fg_attempts_2, aes(x = fg_attempted, y = total_xpa, color = fg_pct, label = kicker_player_name)) +
+  geom_point(alpha = 0.7, size = 3) +  # Points for each kicker
+  geom_text(aes(label = kicker_player_name), vjust = -1, hjust = 0.5, size = 3, check_overlap = TRUE) +  # Labels
+  scale_color_gradient(low = "red", high = "blue") +  # Color gradient for FG Percentage
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  # Dashed line at y = 0
+  labs(title = "CLUTCH MOMENTS (Loose Definition) XPA vs. Field Goal Attempts",
+       x = "Field Goal Attempts",
+       y = "Total Expected Points Added (XPA)",
+       color = "Field Goal Percentage") +
+  theme_minimal()
+```
+
+
+Clutch moments 3
+```{r, fig.width=14, fig.height=6}
+# Create scatter plot with XPA vs. Field Goal Attempts, and color by FG Percentage
+ggplot(kicking_data, aes(x = fg_attempted, y = total_wpa, color = fg_pct, label = kicker_player_name)) +
+  geom_point(alpha = 0.7, size = 3) +  # Points for each kicker
+  geom_text(aes(label = kicker_player_name), vjust = -1, hjust = 0.5, size = 3, check_overlap = TRUE) +  # Labels
+  scale_color_gradient(low = "red", high = "blue") +  # Color gradient for FG Percentage
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +  # Dashed line at y = 0
+  geom_smooth(method = "lm", se = FALSE, color = "darkgray", linetype = "dashed") +  # Line of best fit
+  labs(title = "CLUTCH MOMENTS (WPA) vs. Field Goal Attempts",
+       x = "Field Goal Attempts",
+       y = "Total Win Probability Added (WPA)",
+       color = "Field Goal Percentage") +
+  theme_minimal()
+```
+
+Kicking seasons
+``` {r}
+#temporary field goal pct% data
+kicker_fg_data_temp <- fg_data %>% 
+  group_by(kicker_player_id, season) %>%
+  summarize(total_fg_xpa = sum(xpa, na.rm = TRUE),
+            fg_made = sum(kick_made,na.rm = TRUE),
+            fg_attempted = n()) %>%
+  ungroup() %>%
+  mutate(fg_pct = fg_made / fg_attempted,
+         xpa_per_fg = total_fg_xpa / fg_attempted) %>%
+  left_join(kicker_names, by = "kicker_player_id") #%>%
+  #filter(fg_attempted >= 20)
+
+#temporary PAT data
+kicker_PAT_data_temp <- PAT_data %>% 
+  group_by(kicker_player_id, season) %>%
+  summarize(total_PAT_xpa= sum(xpa, na.rm = TRUE),
+            PAT_made = sum(kick_made),
+            PAT_attempted = n()) %>%
+  ungroup() %>%
+  mutate(PAT_pct = PAT_made / PAT_attempted,
+         xp_per_PAT = total_PAT_xpa / PAT_attempted) #%>%
+  #left_join(kicker_names, by = "kicker_player_id")
+
+#data that has kicker fg%, PAT%, and xpa 
+kicking_data_season <- left_join(kicker_fg_data_temp, kicker_PAT_data_temp, by = c("kicker_player_id", "season")) %>%
+  replace_na(list(total_fg_xpa = 0, total_PAT_xpa = 0)) %>%
+  mutate(total_xpa = total_fg_xpa + total_PAT_xpa)
+
+rm(kicker_fg_data_temp, kicker_PAT_data_temp)
+```
+
+
+```{r, fig.width=14, fig.height=6}
+ggplot(kicking_data_season, aes(x = total_xpa)) +
+  geom_histogram(binwidth = 2, fill = "blue", color = "black", alpha = 0.7) +
+  labs(title = "Distribution of Total XPA per Season", x = "Total XPA", y = "Number of Kicker Seasons") +
+  theme_minimal()
+```
+
+Summary of kicker seasons in which their total xPA season
+```{r}
+kicker_summary <- kicking_data_season %>%
+  group_by(kicker_player_name) %>%
+  summarize(
+    seasons_xpa_positive = sum(total_xpa >= 0, na.rm = TRUE),
+    seasons_xpa_negative = sum(total_xpa < 0, na.rm = TRUE)
+  )
+
+```
+
+
+```{r}
+subset(kicking_data_season, is.na(total_xpa))
+
+
+```
